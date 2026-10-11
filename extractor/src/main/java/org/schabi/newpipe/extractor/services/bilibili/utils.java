@@ -62,6 +62,11 @@ public class utils {
     }
 
     public static long bv2av(String bvid) {
+        // Callers may hand over an entry that carries no bvid at all; that is not worth an
+        // exception, the caller only needs to know there is no cursor.
+        if (bvid == null || bvid.length() < 12) {
+            return 0;
+        }
         char[] bvidArr = bvid.toCharArray();
         char temp = bvidArr[3];
         bvidArr[3] = bvidArr[9];

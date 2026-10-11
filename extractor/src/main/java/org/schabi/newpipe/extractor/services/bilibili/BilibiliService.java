@@ -217,8 +217,98 @@ public class BilibiliService extends StreamingService {
         return result.toString();
     }
 
+    /**
+     * When the identity was last thrown away, see {@link #resetIdentity()}.
+     */
+    private static long lastIdentityReset = 0L;
+
+    /**
+     * Rotating more often than this would only burn the two requests a new identity costs,
+     * while the identity that was just built is still the one being used. It has to stay short
+     * though: a burst of blocked requests all arrive within the same second, and a long window
+     * would keep retrying with the identity that was just refused.
+     */
+    private static final long IDENTITY_RESET_INTERVAL_MS = 3_000L;
+
+    /**
+     * How long an identity may be used before it is replaced. Long lived processes otherwise
+     * accumulate a single identity over hours, which is what risk control ends up refusing.
+     * Rotating costs two requests, so this is cheap.
+     */
+    private static final long IDENTITY_MAX_AGE_MS = 60L * 60L * 1000L;
+
+    /** When the identity currently in use was built, see {@link #IDENTITY_MAX_AGE_MS}. */
+    private static long identityBuiltAt = 0L;
+
+    /** Requests are held back until this moment, see {@link #onBlocked()}. */
+    private static volatile long blockedUntil = 0L;
+
+    /** How long fetching pauses after risk control refuses something, doubled on every repeat. */
+    private static final long BASE_COOLDOWN_MS = 10_000L;
+    private static final long MAX_COOLDOWN_MS = 120_000L;
+    private static long currentCooldownMs = BASE_COOLDOWN_MS;
+
+    /**
+     * Called when risk control refused a request.
+     *
+     * <p>Retrying straight away with a new identity is what keeps the whole session blocked, so
+     * fetching pauses instead: everything waits for the cooldown, which doubles for as long as
+     * refusals keep coming, and then continues with a fresh identity.</p>
+     */
+    public static synchronized void onBlocked() {
+        final long now = System.currentTimeMillis();
+        if (now >= blockedUntil) {
+            // A refusal outside any cooldown starts one, and makes the next one longer.
+            blockedUntil = now + currentCooldownMs;
+            currentCooldownMs = Math.min(currentCooldownMs * 2, MAX_COOLDOWN_MS);
+        }
+        resetIdentity();
+    }
+
+    /** Called after a request went through, so the backoff starts over. */
+    public static synchronized void onSuccess() {
+        currentCooldownMs = BASE_COOLDOWN_MS;
+    }
+
+    /**
+     * Waits out the cooldown, if risk control has one running, before the caller sends anything.
+     */
+    public static void awaitCooldown() {
+        final long wait = blockedUntil - System.currentTimeMillis();
+        if (wait <= 0) {
+            return;
+        }
+        try {
+            Thread.sleep(Math.min(wait, MAX_COOLDOWN_MS));
+        } catch (final InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    /**
+     * Throws the forged identity away so that the next request builds a fresh one.
+     *
+     * <p>BiliBili's risk control eventually answers 412 for a single identity once it has seen
+     * enough requests from it, and the identity is otherwise kept for the whole process, so a
+     * long lived session slowly turns into one that is refused everywhere. Retrying with a new
+     * identity is what gets a refresh going again - regenerating only the forged device, which
+     * is all that used to happen, leaves the cookies untouched and therefore does not help.</p>
+     */
+    public static synchronized void resetIdentity() {
+        final long now = System.currentTimeMillis();
+        if (now - lastIdentityReset < IDENTITY_RESET_INTERVAL_MS) {
+            return;
+        }
+        lastIdentityReset = now;
+        defaultLatestCookies = null;
+        identityBuiltAt = 0L;
+        DeviceForger.regenerateRandomDevice();
+    }
+
     static public LinkedHashMap<String, String> getDefaultCookies() throws IOException {
-        if (defaultLatestCookies == null || Long.parseLong(defaultLatestCookies.get("bili_ticket_expires")) <= Instant.now().getEpochSecond()) {
+        if (defaultLatestCookies == null
+                || System.currentTimeMillis() - identityBuiltAt > IDENTITY_MAX_AGE_MS
+                || Long.parseLong(defaultLatestCookies.get("bili_ticket_expires")) <= Instant.now().getEpochSecond()) {
             Response response;
             try {
                 response = getDownloader().get(FETCH_COOKIE_URL, getUserAgentHeaders(WWW_REFERER));
@@ -256,8 +346,19 @@ public class BilibiliService extends StreamingService {
             cookies.put("buvid_fp", bytesToHex(randomBuvidFp));
 
             defaultLatestCookies = cookies;
+            identityBuiltAt = System.currentTimeMillis();
         }
         return defaultLatestCookies;
+    }
+
+    /**
+     * The cookie header for the identity currently in use.
+     *
+     * <p>A retry has to rebuild this, otherwise it sends the cookies that were just refused and
+     * fails for exactly the same reason.</p>
+     */
+    public static String getCookieHeader() throws IOException {
+        return mapToCookieHeader(getDefaultCookies());
     }
 
     static public LinkedHashMap<String, List<String>> getHeaders(String originalUrl) throws IOException {
@@ -426,7 +527,16 @@ public class BilibiliService extends StreamingService {
 
     @Override
     public long getFeedFetchInterval() {
-        return 10000;
+        // Spacing between two subscriptions of this service during a feed refresh.
+        //
+        // Measured against the app endpoint (x/v2/space/archive/cursor) on 2026-10-11, using
+        // the same forged identity throughout: 40/40 requests at 10 req/s, 60/60 at 20 req/s,
+        // a 32-way concurrent burst at an instantaneous 88 req/s, and the live status endpoint
+        // at 20/20 for 10 req/s - no failure anywhere, so the real ceiling was never reached.
+        // 20 req/s is simply the highest rate that was actually held; half of it, as a safety
+        // margin, is 10 subscriptions per second, i.e. one every 100 ms. The previous value
+        // (10 s) dates from when the far more fragile web endpoint was still used.
+        return 100;
     }
 
     @Override
@@ -533,18 +643,73 @@ public class BilibiliService extends StreamingService {
     }
 
 
+    /**
+     * What the caller already knows about a channel.
+     *
+     * <p>A feed refresh walks over every subscription the user has, and downloading the user
+     * card for each of them costs one request per channel per refresh - which is exactly the
+     * kind of traffic BiliBili's risk control reacts to. The only card field a refresh really
+     * needs is the name, and the name is also present in the video list itself, so the card
+     * only has to be downloaded when nothing is known yet or when the uploader appears to have
+     * renamed themselves.</p>
+     */
+    public static final class ChannelCard {
+        public final String name;
+        public final String avatarUrl;
+        public final long subscriberCount;
+        public final String description;
+
+        public ChannelCard(final String name, final String avatarUrl,
+                           final long subscriberCount, final String description) {
+            this.name = name;
+            this.avatarUrl = avatarUrl;
+            this.subscriberCount = subscriberCount;
+            this.description = description;
+        }
+    }
+
+    /** Thread local, because several subscriptions are extracted in parallel. */
+    private static final ThreadLocal<ChannelCard> knownChannelCard = new ThreadLocal<>();
+
+    public static void setKnownChannelCard(final ChannelCard card) {
+        knownChannelCard.set(card);
+    }
+
+    public static void clearKnownChannelCard() {
+        knownChannelCard.remove();
+    }
+
+    public static ChannelCard getKnownChannelCard() {
+        return knownChannelCard.get();
+    }
+
     public static final int USER_VIDEO_API_MODE_WEB = 0;
     public static final int USER_VIDEO_API_MODE_SEARCH = 1;
     public static final int USER_VIDEO_API_MODE_CLIENT = 2;
     public static final int SIZE_USER_VIDEO_API_MODE = 3;
 
-    private static int userVideoApiMode = USER_VIDEO_API_MODE_WEB;
+    // Which endpoint to use, in order of preference. Measured on 2026-10-11 with the same
+    // set of channels and the same forged identity (12 requests per mode, 1.5 s apart,
+    // stopped at the first failure):
+    //   app endpoint (CLIENT)     12/12 ok, and 24/24 when hammered at 1 request/second
+    //   search endpoint (SEARCH)   7/12 ok
+    //   web endpoint (WEB)         3/12 ok; it answers with the 412 anti-bot page or with
+    //                              code -352 right away and recovers only after ~20 s
+    // The app endpoint is what the official client talks to, so it goes first; the web
+    // endpoint - which used to be the default - goes last.
+    private static final int[] USER_VIDEO_API_MODE_ORDER = {
+            USER_VIDEO_API_MODE_CLIENT,
+            USER_VIDEO_API_MODE_SEARCH,
+            USER_VIDEO_API_MODE_WEB,
+    };
+
+    private static int userVideoApiModeIndex = 0;
 
     public static int getCurrentVideoApiMode() {
-        return userVideoApiMode;
+        return USER_VIDEO_API_MODE_ORDER[userVideoApiModeIndex];
     }
 
     public static void rotateVideoApiMode() {
-        userVideoApiMode = (userVideoApiMode + 1) % SIZE_USER_VIDEO_API_MODE;
+        userVideoApiModeIndex = (userVideoApiModeIndex + 1) % USER_VIDEO_API_MODE_ORDER.length;
     }
 }

@@ -40,6 +40,9 @@ public class BilibiliChannelExtractor extends ChannelExtractor {
     JsonObject userInfoData = new JsonObject();
     JsonObject userLiveData = new JsonObject();
 
+    /** Set when the user card request was skipped, see {@link #onFetchPage}. */
+    private BilibiliService.ChannelCard knownChannelCard;
+
     //region User Video Impl
 
     private final ClientUserVideoImpl clientUserVideoImpl = new ClientUserVideoImpl();
@@ -74,15 +77,63 @@ public class BilibiliChannelExtractor extends ChannelExtractor {
 
         getVideoImpl().onFetchPage(downloader, id, getUrl());
 
-        userInfoData = requestUserSpaceResponse(downloader, QUERY_USER_INFO_URL + id, headers);
+        // A feed refresh tells us what it already knows about this channel, so the user card
+        // (one request per channel, per refresh) is only downloaded when it may have changed.
+        final BilibiliService.ChannelCard knownCard = BilibiliService.getKnownChannelCard();
+        if (knownCard == null || shouldFetchCard(knownCard)) {
+            userInfoData = requestUserSpaceResponse(downloader, QUERY_USER_INFO_URL + id, headers);
+        } else {
+            knownChannelCard = knownCard;
+        }
 
-        userLiveData = requestUserSpaceResponse(downloader, QUERY_LIVEROOM_STATUS_URL + id, headers);
+        // The entry this produces is dropped by the feed anyway - it is a round-play item - so a
+        // feed refresh, which is the only caller that announces itself, does not spend a request
+        // on it. The channel screen still gets its live banner.
+        if (BilibiliService.getKnownChannelCard() == null) {
+            userLiveData = requestUserSpaceResponse(
+                    downloader, QUERY_LIVEROOM_STATUS_URL + id, headers);
+        }
+    }
+
+    /**
+     * Fetches the card when the channel is unknown, when no avatar was ever received, or when
+     * the name in the video list no longer matches the name we know.
+     */
+    private boolean shouldFetchCard(final BilibiliService.ChannelCard known) {
+        if (known.name == null || known.avatarUrl == null || known.avatarUrl.isEmpty()) {
+            return true;
+        }
+        final String currentName = uploaderNameFromVideoList();
+        return currentName == null || !known.name.equals(currentName);
+    }
+
+    /**
+     * Name reported by the video list itself, or {@code null} when that mode does not carry one.
+     */
+    private String uploaderNameFromVideoList() {
+        return getVideoImpl().uploaderName();
     }
 
     @Nonnull
     @Override
     public String getName() throws ParsingException {
+        if (isCardSkipped()) {
+            // The video list carries the very name the card would have told us.
+            final String fromVideoList = uploaderNameFromVideoList();
+            if (fromVideoList != null && !fromVideoList.isEmpty()) {
+                return fromVideoList;
+            }
+            if (knownChannelCard != null && knownChannelCard.name != null) {
+                return knownChannelCard.name;
+            }
+            throw new ParsingException("Could not get channel name");
+        }
         return userInfoData.getObject("data").getObject("card").getString("name");
+    }
+
+    /** True when the user card request was skipped, so its data must not be read. */
+    private boolean isCardSkipped() {
+        return userInfoData.size() == 0;
     }
 
     @Nonnull
@@ -90,14 +141,19 @@ public class BilibiliChannelExtractor extends ChannelExtractor {
     public InfoItemsPage<StreamInfoItem> getInitialPage() throws IOException, ExtractionException {
 
         final StreamInfoItemsCollector collector = new StreamInfoItemsCollector(getServiceId());
-        if (userLiveData.getObject("data").getObject(getId()).getInt("live_status") != 0) {
-            collector.commit(new BilibiliLiveInfoItemExtractor(userLiveData.getObject("data").getObject(getId()), 1));
+        // Absent when the live status was skipped, see onFetchPage.
+        final JsonObject liveData = userLiveData.getObject("data").getObject(getId());
+        if (liveData != null && liveData.getInt("live_status") != 0) {
+            collector.commit(new BilibiliLiveInfoItemExtractor(liveData, 1));
         }
         UserVideoImpl videoImpl = getVideoImpl();
         boolean hasVideos = videoImpl.getInitialPage(collector, this);
         Page nextPage = null;
-        if (hasVideos) nextPage = new Page(getNextPageFromCurrentUrl(
-                getUrl(), "pn", 1, true, "1", "?"), String.valueOf(videoImpl.lastVideo()), null, BilibiliService.getDefaultCookies(), null
+        // 0 means the page carried no usable cursor, and a next page built from it would only
+        // fetch the first page again.
+        final long lastVideo = videoImpl.lastVideo();
+        if (hasVideos && lastVideo > 0) nextPage = new Page(getNextPageFromCurrentUrl(
+                getUrl(), "pn", 1, true, "1", "?"), String.valueOf(lastVideo), null, BilibiliService.getDefaultCookies(), null
         );
         if (ServiceList.BiliBili.getFilterTypes().contains("channels")) {
             collector.applyBlocking(ServiceList.BiliBili.getFilterConfig());
@@ -111,14 +167,24 @@ public class BilibiliChannelExtractor extends ChannelExtractor {
         String id = getId();
         Downloader downloader = getDownloader();
 
-        userInfoData = requestUserSpaceResponse(downloader, QUERY_USER_INFO_URL + id, headers);
+        // Same rule as onFetchPage, and it matters more here: a refresh walks several pages per
+        // channel, and the card endpoint is the one most likely to answer 412 during a refresh.
+        // The hint is what a feed refresh announces, and it already carries everything the card
+        // would return.
+        final BilibiliService.ChannelCard knownCard = BilibiliService.getKnownChannelCard();
+        if (knownCard != null) {
+            knownChannelCard = knownCard;
+        } else {
+            userInfoData = requestUserSpaceResponse(downloader, QUERY_USER_INFO_URL + id, headers);
+        }
 
         final StreamInfoItemsCollector collector = new StreamInfoItemsCollector(getServiceId());
         UserVideoImpl videoImpl = getVideoImpl();
         boolean hasVideos = videoImpl.getPage(page, collector, getDownloader(), this, getId());
         Page nextPage = null;
-        if (hasVideos) nextPage = new Page(
-                getNextPageFromCurrentUrl(page.getUrl(), "pn", 1), String.valueOf(videoImpl.lastVideo()), null, BilibiliService.getDefaultCookies(), null
+        final long lastVideo = videoImpl.lastVideo();
+        if (hasVideos && lastVideo > 0) nextPage = new Page(
+                getNextPageFromCurrentUrl(page.getUrl(), "pn", 1), String.valueOf(lastVideo), null, BilibiliService.getDefaultCookies(), null
         );
         if (ServiceList.BiliBili.getFilterTypes().contains("channels")) {
             collector.applyBlocking(ServiceList.BiliBili.getFilterConfig());
@@ -128,21 +194,34 @@ public class BilibiliChannelExtractor extends ChannelExtractor {
 
     @Override
     public String getAvatarUrl() throws ParsingException {
+        if (isCardSkipped()) {
+            // Whatever we knew is handed back unchanged, so persisting it stays a no-op.
+            return knownChannelCard != null ? knownChannelCard.avatarUrl : null;
+        }
         return userInfoData.getObject("data").getObject("card").getString("face").replace("http:", "https:");
     }
 
     @Override
     public String getBannerUrl() throws ParsingException {
+        if (isCardSkipped()) {
+            return null;
+        }
         return userInfoData.getObject("data").getObject("space").getString("l_img").replace("http:", "https:");
     }
 
     @Override
     public long getSubscriberCount() throws ParsingException {
+        if (isCardSkipped()) {
+            return knownChannelCard != null ? knownChannelCard.subscriberCount : -1;
+        }
         return userInfoData.getObject("data").getObject("card").getLong("fans");
     }
 
     @Override
     public String getDescription() throws ParsingException {
+        if (isCardSkipped()) {
+            return knownChannelCard != null ? knownChannelCard.description : null;
+        }
         return userInfoData.getObject("data").getObject("card").getString("sign");
     }
 
@@ -211,6 +290,14 @@ public class BilibiliChannelExtractor extends ChannelExtractor {
          * @return av
          */
         long lastVideo();
+
+        /**
+         * Name of the uploader as reported by the video list itself, or {@code null} when this
+         * mode does not include one.
+         */
+        default String uploaderName() {
+            return null;
+        }
     }
 
     /**
@@ -222,6 +309,31 @@ public class BilibiliChannelExtractor extends ChannelExtractor {
 
         private JsonArray getVideosArray() {
             return userVideoData.getObject("data").getArray("item");
+        }
+
+        /**
+         * The client API answers "is there another page" itself. A non-empty item array is not
+         * an answer: a channel with a single video still fills one page, and reporting a next
+         * page for it leaves the channel screen with a load-more footer that can never be
+         * satisfied - and, because a one item list does not scroll, never even triggers.
+         */
+        private boolean hasNextPage() {
+            try {
+                return userVideoData.getObject("data").getBoolean("has_next", false);
+            } catch (final RuntimeException e) {
+                return false;
+            }
+        }
+
+        @Override
+        public String uploaderName() {
+            try {
+                final JsonArray items = getVideosArray();
+                return items == null || items.isEmpty() ? null : items.getObject(0).getString("author");
+            } catch (final RuntimeException e) {
+                // No usable list: fall back to downloading the card.
+                return null;
+            }
         }
 
         private void fetchViaAPI(Downloader downloader, String id, long lastVideoAid)
@@ -272,10 +384,8 @@ public class BilibiliChannelExtractor extends ChannelExtractor {
 
             if (!videosArray.isEmpty()) {
                 collectVideos(collector, extractor, videosArray);
-                return true;
-            } else {
-                return false;
             }
+            return hasNextPage();
         }
 
         @Override
@@ -293,23 +403,29 @@ public class BilibiliChannelExtractor extends ChannelExtractor {
 
             if (!videosArray.isEmpty()) {
                 collectVideos(collector, extractor, videosArray);
-                return true;
-            } else {
-                return false;
             }
+            return hasNextPage();
         }
 
         @Override
         public long lastVideo() {
             JsonArray videosArray = getVideosArray();
-            if (!videosArray.isEmpty()) {
-                JsonObject last = videosArray.getObject(videosArray.size() - 1);
-                String type = last.getString("goto");
-                String num = last.getString("param");
+            // Not every entry carries a usable id - a round-play entry, or whatever the space
+            // API appends at the end of a page, may have neither param nor bvid. Walk back to
+            // the last entry that does rather than failing the whole channel.
+            for (int i = videosArray.size() - 1; i >= 0; i--) {
+                final JsonObject item = videosArray.getObject(i);
+                final String type = item.getString("goto");
+                final String num = item.getString("param");
                 if ("av".equals(type) && num != null) {
-                    return Long.parseLong(num);
-                } else {
-                    String bv = last.getString("bvid");
+                    try {
+                        return Long.parseLong(num);
+                    } catch (final NumberFormatException ignored) {
+                        // fall through and try the bvid
+                    }
+                }
+                final String bv = item.getString("bvid");
+                if (bv != null && !bv.isEmpty()) {
                     return utils.bv2av(bv);
                 }
             }
@@ -435,6 +551,17 @@ public class BilibiliChannelExtractor extends ChannelExtractor {
             return userVideoData.getObject("data").getObject("list").getArray("vlist");
         }
 
+        @Override
+        public String uploaderName() {
+            try {
+                final JsonArray items = getVideosArray();
+                return items == null || items.isEmpty() ? null : items.getObject(0).getString("author");
+            } catch (final RuntimeException e) {
+                // No usable list: fall back to downloading the card.
+                return null;
+            }
+        }
+
         private void fetchViaAPI(Downloader downloader, String id, String currentUrl)
                 throws ParsingException, IOException, ReCaptchaException {
             Map<String, List<String>> headers = getHeaders(currentUrl);
@@ -548,12 +675,21 @@ public class BilibiliChannelExtractor extends ChannelExtractor {
         int currentTry = maxTry;
 
         String responseBody = "";
+        // The url of the risk control page, when that is what came back, so the caller can be
+        // sent to it instead of only being told that something was refused.
+        String riskControlPage = null;
 
         while (currentTry > 0) {
+            // Risk control pauses everything for a while; only continue once that has passed.
+            BilibiliService.awaitCooldown();
+            // Rebuild the cookies, otherwise the retry carries the identity that was refused.
+            headers.put("Cookie",
+                    Collections.singletonList(BilibiliService.getCookieHeader()));
             responseBody = downloader.get(url, headers).responseBody();
             if (responseBody.startsWith("<!DOCTYPE html>")) {
                 // returns HTML, due to risk control
-                DeviceForger.regenerateRandomDevice(); // try to regenerate a new one
+                riskControlPage = url;
+                BilibiliService.onBlocked();
                 currentTry -= 1;
                 continue;
             }
@@ -563,10 +699,11 @@ public class BilibiliChannelExtractor extends ChannelExtractor {
                 if (code != 0) {
                     if (code == -352) {
                         // blocked risk control
-                        DeviceForger.regenerateRandomDevice(); // try to regenerate a new one
+                        BilibiliService.onBlocked();
                     }
                     currentTry -= 1;
                 } else {
+                    BilibiliService.onSuccess();
                     return responseJson;
                 }
             } catch (JsonParserException e) {
@@ -581,7 +718,15 @@ public class BilibiliChannelExtractor extends ChannelExtractor {
                 + "\nTry to refresh, or report this!\n"
                 + responseBody;
         rotateVideoApiMode();
-        DeviceForger.regenerateRandomDevice(); // try to regenerate a new one
+        BilibiliService.onBlocked(); // keep the pause in place, the retry already failed
+
+        if (riskControlPage != null) {
+            // PipePipe knows what to do with this one: the error panel turns it into a button
+            // that opens the url in a WebView, where BiliBili's own page - the very one that was
+            // returned here - solves the challenge and leaves its cookies behind for the retry.
+            throw new ReCaptchaException(
+                    "BiliBili risk control refused the request", riskControlPage);
+        }
         throw new ParsingException(msg);
     }
 
