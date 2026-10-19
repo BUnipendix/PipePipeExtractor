@@ -58,6 +58,9 @@ public class BilibiliBulletCommentsInfoItemExtractor implements BulletCommentsIn
 
     @Override
     public Duration getDuration() throws ParsingException {
-        return Duration.ofMillis((long) (Double.parseDouble(attr[0])*1000) + 2500); //2500 for sync
+        // The Bilibili XML "p" attribute stores the timestamp in seconds. The old renderer added
+        // a +2500 ms offset to compensate for its animator-based scheduling; the clock-driven
+        // danmaku engine renders at the exact video timestamp, so no offset is applied.
+        return Duration.ofMillis((long) (Double.parseDouble(attr[0]) * 1000));
     }
 }
